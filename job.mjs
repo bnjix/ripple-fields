@@ -1,15 +1,17 @@
 // Ripple's field job: the Map's worldwide Wind and Swell layers, made ahead (18 Nov 2026).
 //
 // For each model it reads the newest complete run from Open-Meteo's public model files on S3
-// (https://openmeteo.s3.amazonaws.com/data_spatial/<model>/), and for every forecast hour (hourly to 48 h, three-hourly
-// to day 7) writes ONE file holding that hour's whole tile pyramid (format.mjs), plus a small latest.json per model.
-// The phone fetches a tile with an HTTP Range request. With --upload the files go to the R2 bucket behind
-// tiles.ripple.surf under fields/<model>/<run>/, latest.json last; the run before the previous one is then deleted, so
-// two runs are kept. A run that isn't complete yet is left for next time: the old one stays.
+// (https://openmeteo.s3.amazonaws.com/data_spatial/<model>/; which run: runs.mjs), and for every forecast hour (hourly
+// to 48 h, then three-hourly to the model's reach: ECMWF day 7, GFS-Wave day 16, HRRR 48 h) writes ONE file holding
+// that hour's whole tile pyramid (format.mjs), plus a small latest.json per model. The phone fetches a tile with an
+// HTTP Range request. With --upload the files go to the R2 bucket behind tiles.ripple.surf under
+// fields/<model>/<run>/, latest.json last; the run before the previous one is then deleted, so two runs are kept. A run
+// that isn't complete yet is left for next time: the old one stays. A making.json written before the first file names
+// the run being made, so files of a run whose job died half way are deleted by the next job.
 //
-//   node job.mjs [--model ecmwf|gfswave|all] [--out DIR] [--hours N] [--upload] [--force]
+//   node job.mjs [--model ecmwf|gfswave|hrrr|all] [--out DIR] [--hours N] [--from H] [--upload] [--force]
 //
-// --hours N makes only the first N hours (to measure); --force remakes a run already on the bucket.
+// --hours N makes only the first N hours, --from H only hours H and later (to measure); --force remakes a run already on the bucket.
 // Uploads go through wrangler (env WRANGLER, else `npx wrangler`), which needs CLOUDFLARE_API_TOKEN and
 // CLOUDFLARE_ACCOUNT_ID in CI (or a logged-in wrangler on a laptop).
 //
@@ -17,37 +19,23 @@
 import { OmDataType, OmFileReader } from '@openmeteo/file-reader';
 import { deflateRawSync } from 'node:zlib';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { join } from 'node:path';
-import { NONE, SIZE, SWELL_PLANES, WIND_PLANES, pack, sampleLonLat, stamp } from './format.mjs';
+import { NONE, SIZE, SWELL_PLANES, WIND_PLANES, boxesFor, pack, sampleLonLat, stamp, tilesIn } from './format.mjs';
+import { MODELS, PUBLIC, decide, fileUrl, manifest, get as getOnce } from './runs.mjs';
 
-const S3 = 'https://openmeteo.s3.amazonaws.com/data_spatial/';
-const PUBLIC = 'https://tiles.ripple.surf/fields/';
 const BUCKET = 'ripple-seafloor', PREFIX = 'fields';
 
 const arg = (k, d) => { const i = process.argv.indexOf(k); return i < 0 ? d : process.argv[i + 1]; };
 const has = (k) => process.argv.includes(k);
-const OUT = arg('--out', 'out'), ONLY = arg('--model', 'all'), MAXH = Number(arg('--hours', '9999')), UPLOAD = has('--upload'), FORCE = has('--force');
+const OUT = arg('--out', 'out'), ONLY = arg('--model', 'all'), MAXH = Number(arg('--hours', '9999')), FROMH = Number(arg('--from', '0')), UPLOAD = has('--upload'), FORCE = has('--force');
 
-/** What we make, per model. Zooms by the data's own detail: 9 km wind about zoom 6, GFS-Wave's 0.25° about zoom 4–5. */
-const MODELS = {
-  ecmwf: { layer: 'wind', file: 'ecmwf_ifs', zmin: 2, zmax: 6 },
-  gfswave: { layer: 'swell', file: 'ncep_gfswave025', zmin: 2, zmax: Number(arg('--swell-zmax', '5')) },
-};
+MODELS.gfswave.zmax = Number(arg('--swell-zmax', MODELS.gfswave.zmax));
 
 /* ------------------------------------------------------------ reading Open-Meteo's files */
 
 let downloaded = 0, requests = 0;
-async function get(url, range) {
-  for (let a = 0; ; a++) {
-    try {
-      const r = await fetch(url, { headers: range ? { range } : {} });
-      if (r.ok) { const b = new Uint8Array(await r.arrayBuffer()); downloaded += b.length; requests++; return { r, b }; }
-      if (r.status === 404 || a >= 3) throw new Error(`S3 ${r.status} ${url}`);
-    } catch (e) { if (a >= 3) throw e; }
-    await new Promise((res) => setTimeout(res, 1000 * (a + 1)));
-  }
-}
+const get = async (url, range) => { const o = await getOnce(url, range); downloaded += o.b.length; requests++; return o; };
 /** Byte ranges for the reader, gathered: the file's tail with the first request, near ranges merged, a megabyte read ahead. */
 class RangeFile {
   constructor(url) { this.url = url; this.size = -1; this.spans = []; this.pending = []; }
@@ -88,15 +76,6 @@ async function readVars(url, names) {
   file.spans = [];
   return out;
 }
-async function manifest(model) {
-  const { b } = await get(`${S3}${model}/latest.json`);
-  return JSON.parse(new TextDecoder().decode(b).replace(/[\n\r\t]/g, ' '));
-}
-const pad = (n) => String(n).padStart(2, '0');
-function fileUrl(model, run, time) {
-  const r = new Date(run * 1000), t = new Date(time * 1000);
-  return `${S3}${model}/${r.getUTCFullYear()}/${pad(r.getUTCMonth() + 1)}/${pad(r.getUTCDate())}/${pad(r.getUTCHours())}00Z/${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}-${pad(t.getUTCDate())}T${pad(t.getUTCHours())}${pad(t.getUTCMinutes())}.om`;
-}
 
 /* ------------------------------------------------------------ sampling (as functions/_field.ts does on the server) */
 
@@ -131,6 +110,38 @@ function gaussian() {
     }
     return true;
   };
+}
+/**
+ * NOAA's HRRR grid (Lambert conformal on a sphere, both standard parallels the same, origin at the equator), its first
+ * square at the manifest's south-west corner. Also the angle its winds are turned by (they run along the grid's own
+ * axes, which turn with longitude on the cone) and the domain's latitude/longitude box, from walking its edge.
+ */
+function lambert(man, dims) {
+  const wkt = man.crs_wkt, num = (k, d) => Number(new RegExp(`${k}",?\\s*([-\\d.]+)`).exec(wkt)?.[1] ?? d);
+  const R = num('Sphere', 6371229), p1 = (num('Latitude of 1st standard parallel', 38.5) * Math.PI) / 180, lon0 = num('Longitude of false origin', -97.5);
+  const n = Math.sin(p1), FR = (R * Math.cos(p1) * Math.pow(Math.tan(Math.PI / 4 + p1 / 2), n)) / n, rho0 = FR;
+  const xy = (lat, lon) => { const rho = FR / Math.pow(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360), n), th = n * ((((lon - lon0 + 540) % 360) - 180) * Math.PI) / 180; return [rho * Math.sin(th), rho0 - rho * Math.cos(th)]; };
+  const ll = (x, y) => { const rho = Math.hypot(x, rho0 - y), th = Math.atan2(x, rho0 - y); return [(2 * Math.atan(Math.pow(FR / rho, 1 / n)) - Math.PI / 2) * 180 / Math.PI, lon0 + (th / n) * 180 / Math.PI]; };
+  const [s, w, nn, e] = /BBOX\[([^\]]*)\]/.exec(wkt)[1].split(',').map(Number), ny = dims[0], nx = dims[1];
+  const [x0, y0] = xy(s, w), [x1, y1] = xy(nn, e), dx = (x1 - x0) / (nx - 1), dy = (y1 - y0) / (ny - 1);
+  const area = [90, 180, -90, -180];
+  for (let k = 0; k <= 2 * (nx + ny); k++) {
+    const [c, r] = k <= nx ? [k, 0] : k <= nx + ny ? [nx - 1, k - nx] : k <= 2 * nx + ny ? [2 * nx + ny - k, ny - 1] : [0, 2 * (nx + ny) - k];
+    const [la, lo] = ll(x0 + Math.min(c, nx - 1) * dx, y0 + Math.min(r, ny - 1) * dy);
+    area[0] = Math.min(area[0], la); area[1] = Math.min(area[1], lo); area[2] = Math.max(area[2], la); area[3] = Math.max(area[3], lo);
+  }
+  const at = (lat, lon, idx, wt) => {
+    const [x, y] = xy(lat, lon), fr = (y - y0) / dy, fc = (x - x0) / dx;
+    if (!(fr >= -0.5 && fr <= ny - 0.5 && fc >= -0.5 && fc <= nx - 0.5)) return false;
+    const r = Math.floor(fr), c = Math.floor(fc), a = fr - r, b = fc - c;
+    const col = (cc) => Math.max(0, Math.min(nx - 1, cc)), row = (rr) => Math.max(0, Math.min(ny - 1, rr));
+    idx[0] = row(r) * nx + col(c); wt[0] = (1 - a) * (1 - b);
+    idx[1] = row(r) * nx + col(c + 1); wt[1] = (1 - a) * b;
+    idx[2] = row(r + 1) * nx + col(c); wt[2] = a * (1 - b);
+    idx[3] = row(r + 1) * nx + col(c + 1); wt[3] = a * b;
+    return true;
+  };
+  return Object.assign(at, { area: area.map((v, i) => (i < 2 ? Math.floor(v * 100) : Math.ceil(v * 100)) / 100), turn: (lon) => (n * ((((lon - lon0 + 540) % 360) - 180) * Math.PI)) / 180 });
 }
 /** Bilinear from four taps, leaving out corners with no value: none if they hold under a third of the weight. */
 function mixAt(d, idx, wt) { let s = 0, w = 0; for (let q = 0; q < 4; q++) { const v = d[idx[q]]; if (!Number.isFinite(v)) continue; s += v * wt[q]; w += wt[q]; } return w > 0.34 ? s / w : NaN; }
@@ -177,8 +188,15 @@ const N2 = SIZE * SIZE;
 function windTile(V, seaAt, at, z, x, y, zmax) {
   // the finest zoom only over the sea and a coastal band (inland the coarser tile carries on)
   if (z === zmax && !nearSea(seaAt, z, x, y)) return null;
-  const T = tapsFor(at, z, x, y), S = tapsFor(seaAt.at, z, x, y);
+  const T = tapsFor(at, z, x, y);
+  if (at.area && T.idx.every((i) => i < 0)) return null;   // a regional model: nothing of it in this tile
+  const S = tapsFor(seaAt.at, z, x, y);
   const u = mixTile(V.u, T), v = mixTile(V.v, T), g = V.gust ? mixTile(V.gust, T) : null, p = V.p ? mixTile(V.p, T) : null;
+  // winds along the grid's own axes (HRRR) turned back to east and north
+  if (at.turn) for (let j = 0; j < SIZE; j++) for (let i = 0; i < SIZE; i++) {
+    const k = j * SIZE + i, a = at.turn(sampleLonLat(z, x, y, i, j)[0]), c = Math.cos(a), sn = Math.sin(a), uu = u[k], vv = v[k];
+    u[k] = uu * c + vv * sn; v[k] = -uu * sn + vv * c;
+  }
   const sea = new Float32Array(N2);
   for (let k = 0; k < N2; k++) { let s = 0, w = 0; for (let q = 0; q < 4; q++) { const ix = S.idx[k * 4 + q]; if (ix < 0) continue; s += seaAt.mask[ix] * S.wt[k * 4 + q]; w += S.wt[k * 4 + q]; } sea[k] = w ? s / w : 0; }
   const out = new Uint8Array(N2 * WIND_PLANES.length).fill(NONE);
@@ -191,8 +209,14 @@ function windTile(V, seaAt, at, z, x, y, zmax) {
   }
   return deflateRawSync(out);
 }
-/** Any sea within the tile or a quarter of a tile round it (16 × 16 looks). */
+/** Any sea within the tile or a quarter of a tile round it (16 × 16 looks); the same every hour, so kept. */
+const nearSeen = new Map();
 function nearSea(seaAt, z, x, y) {
+  const key = `${z}/${x}/${y}`;
+  if (!nearSeen.has(key)) nearSeen.set(key, nearSeaNow(seaAt, z, x, y));
+  return nearSeen.get(key);
+}
+function nearSeaNow(seaAt, z, x, y) {
   const i4 = new Int32Array(4), w4 = new Float32Array(4), n = 2 ** z;
   for (let j = -2; j <= 17; j++) for (let i = -2; i <= 17; i++) {
     const mx = (x + i / 16) / n, my = Math.max(0, Math.min(1, (y + j / 16) / n));
@@ -224,18 +248,28 @@ function swellTile(V, at, z, x, y) {
 
 /* ------------------------------------------------------------ the run */
 
-/** Hourly to 48 h, then every third hour to day 7 (or the model's own steps where coarser). */
-const pickTimes = (run, times) => times.filter((t) => { const h = (t - run) / 3600; return h >= 0 && (h <= 48 || (h <= 168 && h % 3 === 0)); });
-
+/** Hourly to 48 h, then every third hour to the model's reach (or the model's own steps where coarser). */
+const pickTimes = (run, times, reach) => times.filter((t) => { const h = (t - run) / 3600; return h >= 0 && h <= reach && (h <= 48 || h % 3 === 0); });
 let wranglerBin = process.env.WRANGLER;
-function wrangler(...a) {
+/** One wrangler command, tried three times. */
+async function wrangler(...a) {
   const cmd = wranglerBin ?? 'npx', args = wranglerBin ? a : ['--yes', 'wrangler', ...a];
   for (let k = 0; ; k++) {
-    try { execFileSync(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] }); return; } catch (e) { if (k >= 2) throw e; }
+    try { return await new Promise((res, rej) => execFile(cmd, args, { maxBuffer: 1 << 24 }, (e) => (e ? rej(e) : res()))); } catch (e) { if (k >= 2) throw e; }
   }
 }
 const put = (key, file, type, cache) => wrangler('r2', 'object', 'put', `${BUCKET}/${PREFIX}/${key}`, '--file', file, '--content-type', type, '--cache-control', cache, '--remote');
-const del = (key) => { try { wrangler('r2', 'object', 'delete', `${BUCKET}/${PREFIX}/${key}`, '--remote'); } catch { /* gone already */ } };
+const del = (key) => wrangler('r2', 'object', 'delete', `${BUCKET}/${PREFIX}/${key}`, '--remote').catch(() => { /* gone already */ });
+/** Uploads and deletes run a few at a time beside the making of the next hours (each wrangler call is mostly waiting). */
+const busy = new Set();
+let upFailed = null;
+async function soon(p) {
+  const q = p.catch((e) => { upFailed ??= e; }).finally(() => busy.delete(q));
+  busy.add(q);
+  while (busy.size >= 4) await Promise.race(busy);
+  if (upFailed) throw upFailed;
+}
+async function settled() { await Promise.all(busy); if (upFailed) throw upFailed; }
 
 let peakRss = 0;
 const rss = () => { peakRss = Math.max(peakRss, process.memoryUsage().rss); };
@@ -249,51 +283,73 @@ async function seaMask() {
   return { mask, at: regular(m, v.dims) };
 }
 
+/** Every hour file of a run {run, times} deleted from storage. */
+const dropRun = async (id, r) => { for (const t of r.times) await soon(del(`${id}/${r.run}/${stamp(t)}.rfp`)); await settled(); };
+
 async function doModel(id) {
-  const M = MODELS[id], man = await manifest(M.file);
-  if (!man.completed) { console.log(id, 'run', man.reference_time, 'not complete yet: left for next time'); return; }
-  const run = Date.parse(man.reference_time) / 1000, runS = stamp(run);
-  const cur = await fetch(`${PUBLIC}${id}/latest.json`, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
-  if (cur?.run === runS && !FORCE) { console.log(id, 'already has run', runS); return; }
-  const times = pickTimes(run, man.valid_times.map((t) => Date.parse(t) / 1000)).slice(0, MAXH);
+  await Promise.all(busy); upFailed = null;
+  const M = MODELS[id], d = await decide(id, FORCE);
+  if (!d.make) { console.log(id, d.why); return; }
+  const { man, run, cur } = d, runS = stamp(run);
+  const times = pickTimes(run, man.valid_times.map((t) => Date.parse(t) / 1000), M.hours).filter((t) => t - run >= FROMH * 3600).slice(0, MAXH);
   console.log(id, 'run', runS, times.length, 'hours, zoom', M.zmin, 'to', M.zmax);
+  // after this run: it is latest and the one there now its prev; any other run's files go
+  const prev = cur && cur.run !== runS ? { run: cur.run, times: cur.times } : cur?.prev ?? null;
+  const keep = (r) => r && (r.run === runS || r.run === prev?.run);
+  const making = { run: runS, times, drop: [cur, cur?.prev].filter((r) => r && !keep(r)).map((r) => ({ run: r.run, times: r.times })) };
+  mkdirSync(join(OUT, PREFIX, id), { recursive: true });
+  const makingPath = join(OUT, PREFIX, id, 'making.json');
+  if (UPLOAD) {
+    // a job that died half way left its making.json: what it was making, and what it was to drop
+    const was = await fetch(`${PUBLIC}${id}/making.json`, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    for (const r of was ? [was, ...(was.drop ?? [])] : []) if (r.run && !keep(r) && !making.drop.some((q) => q.run === r.run)) { console.log(id, 'dropping files left by an earlier job:', r.run); await dropRun(id, r); }
+    writeFileSync(makingPath, JSON.stringify(making));
+    await put(`${id}/making.json`, makingPath, 'application/json', 'no-store');
+  }
   const seaAt = M.layer === 'wind' ? await seaMask() : null;
   const dir = join(OUT, PREFIX, id, runS);
   mkdirSync(dir, { recursive: true });
-  let at = null, total = 0;
+  let at = null, boxes = null, total = 0;
   const t0 = Date.now(), c0 = process.cpuUsage();
   for (const time of times) {
     const d0 = downloaded, h0 = Date.now(), hc = process.cpuUsage();
     const names = M.layer === 'wind' ? ['wind_u_component_10m', 'wind_v_component_10m', 'wind_gusts_10m', 'pressure_msl'] : SWELL_VARS.flat();
     const raw = await readVars(fileUrl(M.file, run, time), names);
     const first = Object.values(raw)[0];
-    at ??= M.layer === 'wind' ? gaussian() : regular(man, first.dims);
+    at ??= M.file === 'ecmwf_ifs' ? gaussian() : /Lambert Conic/.test(man.crs_wkt) ? lambert(man, first.dims) : regular(man, first.dims);
     const V = M.layer === 'wind' ? { u: raw.wind_u_component_10m?.data, v: raw.wind_v_component_10m?.data, gust: raw.wind_gusts_10m?.data, p: raw.pressure_msl?.data } : Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, v.data]));
     if (M.layer === 'wind' && (!V.u || !V.v)) throw new Error(`no wind in ${stamp(time)}`);
     const tiles = new Map();
-    for (let z = M.zmin; z <= M.zmax; z++) for (let y = 0; y < 2 ** z; y++) for (let x = 0; x < 2 ** z; x++) {
+    // the tiles that can exist at each zoom: the whole world, or a regional model's area (the file's table covers only these)
+    boxes ??= boxesFor(M.zmin, M.zmax, at.area);
+    for (let z = M.zmin; z <= M.zmax; z++) for (let y = boxes[z - M.zmin][2]; y <= boxes[z - M.zmin][3]; y++) for (let x = boxes[z - M.zmin][0]; x <= boxes[z - M.zmin][1]; x++) {
       const b = M.layer === 'wind' ? windTile(V, seaAt, at, z, x, y, M.zmax) : swellTile(V, at, z, x, y);
       if (b) tiles.set(`${z}/${x}/${y}`, b);
     }
-    const buf = pack(M.zmin, M.zmax, (M.layer === 'wind' ? WIND_PLANES : SWELL_PLANES).length, tiles), name = `${stamp(time)}.rfp`, path = join(dir, name);
+    const buf = pack(M.zmin, M.zmax, (M.layer === 'wind' ? WIND_PLANES : SWELL_PLANES).length, tiles, boxes), name = `${stamp(time)}.rfp`, path = join(dir, name);
     writeFileSync(path, buf);
     total += buf.length;
     const cpu = process.cpuUsage(hc);
     rss();
-    let up = 0;
-    if (UPLOAD) { const u0 = Date.now(); put(`${id}/${runS}/${name}`, path, 'application/octet-stream', 'public, max-age=31536000, immutable'); up = Date.now() - u0; rmSync(path); }
-    console.log(`${id} ${stamp(time)} tiles ${tiles.size} file ${(buf.length / 1e6).toFixed(2)} MB  download ${((downloaded - d0) / 1e6).toFixed(1)} MB  cpu ${((cpu.user + cpu.system) / 1e6).toFixed(1)} s  wall ${((Date.now() - h0) / 1000).toFixed(1)} s${UPLOAD ? `  upload ${(up / 1000).toFixed(1)} s` : ''}  peak ${(peakRss / 1e6).toFixed(0)} MB`);
+    let wait = 0;
+    if (UPLOAD) { const u0 = Date.now(); await soon(put(`${id}/${runS}/${name}`, path, 'application/octet-stream', 'public, max-age=31536000, immutable').then(() => rmSync(path))); wait = Date.now() - u0; }
+    console.log(`${id} ${stamp(time)} tiles ${tiles.size} file ${(buf.length / 1e6).toFixed(2)} MB  download ${((downloaded - d0) / 1e6).toFixed(1)} MB  cpu ${((cpu.user + cpu.system) / 1e6).toFixed(1)} s  wall ${((Date.now() - h0) / 1000).toFixed(1)} s${UPLOAD ? `  waited for uploads ${(wait / 1000).toFixed(1)} s` : ''}  peak ${(peakRss / 1e6).toFixed(0)} MB`);
   }
+  if (UPLOAD) await settled();   // every hour file up before the pointer moves
   const cpu = process.cpuUsage(c0);
+  if (boxes) console.log(`${id} table ${((8 * boxes.length + 2 * tilesIn(boxes)) / 1024).toFixed(1)} KB a file`);
   console.log(`${id} run ${runS}: ${times.length} files, ${(total / 1e9).toFixed(2)} GB, cpu ${((cpu.user + cpu.system) / 1e6).toFixed(0)} s, wall ${((Date.now() - t0) / 1000).toFixed(0)} s, peak ${(peakRss / 1e6).toFixed(0)} MB`);
   // the pointer, last; the run before the previous one goes
-  const latest = { model: id, run: runS, times, zmin: M.zmin, zmax: M.zmax, planes: (M.layer === 'wind' ? WIND_PLANES : SWELL_PLANES).length, path: `${id}/${runS}/`, made: Math.round(Date.now() / 1000), prev: cur ? { run: cur.run, times: cur.times } : null };
+  // area: a regional model's latitude/longitude box [south, west, north, east] (no tiles outside it)
+  const latest = { model: id, run: runS, times, zmin: M.zmin, zmax: M.zmax, ...(at?.area ? { area: at.area } : {}), boxes, planes: (M.layer === 'wind' ? WIND_PLANES : SWELL_PLANES).length, path: `${id}/${runS}/`, made: Math.round(Date.now() / 1000), prev };
   writeFileSync(join(OUT, PREFIX, id, 'latest.json'), JSON.stringify(latest));
   if (UPLOAD) {
-    put(`${id}/latest.json`, join(OUT, PREFIX, id, 'latest.json'), 'application/json', 'public, max-age=300');
-    const old = cur?.prev;
-    if (old && old.run !== runS && old.run !== cur.run) for (const t of old.times) del(`${id}/${old.run}/${stamp(t)}.rfp`);
-    console.log(id, 'uploaded; dropped run', old?.run ?? 'none');
+    await put(`${id}/latest.json`, join(OUT, PREFIX, id, 'latest.json'), 'application/json', 'public, max-age=300');
+    for (const r of making.drop) await dropRun(id, r);
+    // done: nothing left to drop
+    writeFileSync(makingPath, JSON.stringify({ run: runS, times, drop: [] }));
+    await put(`${id}/making.json`, makingPath, 'application/json', 'no-store');
+    console.log(id, 'uploaded; dropped run', making.drop.map((r) => r.run).join(', ') || 'none');
   }
 }
 

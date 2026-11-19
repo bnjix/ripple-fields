@@ -1,36 +1,63 @@
-# Ripple's worldwide wind and swell map tiles, made ahead (see README.md). Four times a day, each a little after the
-# models' runs are complete on Open-Meteo's bucket (GFS-Wave about 5 h after its 00/06/12/18 UTC start, ECMWF about
-# 7–8 h after); a run not complete yet is left for the next time and the old one stays on the map. Wind and swell are
-# two jobs side by side, each about 20–30 minutes, so one failing or running long never holds the other back.
+# Ripple's wind and swell map tiles, made ahead (see README.md). Wakes every hour at :56 and makes, per model, the newest
+# run complete on Open-Meteo's bucket: ECMWF wind to day 7 (runs complete about 6–6.5 h after their 00/06/12/18 UTC
+# start), GFS-Wave swell to day 16 (about 5–5.5 h after), HRRR US wind to 48 h (its 00/06/12/18 UTC runs only, which
+# complete about 1 h 50 after their start; :56 catches them the same hour). A run not complete yet is left for the next
+# hour and the old one stays on the map.
+#
+# Each model is its own job, so one failing or running long never holds the others back. A tiny pre-check (runs.mjs,
+# no dependencies) asks first whether storage already holds the newest complete run; if so the job stops there, before
+# installing anything. A model's jobs never overlap: a wake while one is still running waits behind it (at most one
+# waiting), and its pre-check then usually finds nothing new.
+#
+# Twice a month a keep-alive re-enables this workflow through GitHub's API (the default token with actions: write), as
+# GitHub turns off schedules in a public repository after 60 days without commits.
+#
 # Secrets: CLOUDFLARE_API_TOKEN (allowed to write R2) and CLOUDFLARE_ACCOUNT_ID.
 name: Field tiles
 
 on:
   schedule:
-    - cron: '15 2,8,14,20 * * *'
+    - cron: '56 * * * *'
+    - cron: '17 5 3,18 * *'   # keep-alive only
   workflow_dispatch:
 
 jobs:
   tiles:
+    if: github.event.schedule != '17 5 3,18 * *'
     name: ${{ matrix.model }}
     strategy:
       fail-fast: false
       matrix:
-        model: [ecmwf, gfswave]
+        model: [ecmwf, gfswave, hrrr]
     concurrency:
       group: fields-${{ matrix.model }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - id: check
+        run: node runs.mjs --model ${{ matrix.model }}
+      - if: steps.check.outputs.make == 'true'
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm ci
-      - run: node job.mjs --model ${{ matrix.model }} --upload --out out
+      - if: steps.check.outputs.make == 'true'
+        run: npm ci
+      - if: steps.check.outputs.make == 'true'
+        run: node job.mjs --model ${{ matrix.model }} --upload --out out
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  keepalive:
+    if: github.event.schedule == '17 5 3,18 * *'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/fields.yml/enable"
+        env:
+          GH_TOKEN: ${{ github.token }}
