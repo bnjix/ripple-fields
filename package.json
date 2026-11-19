@@ -1,0 +1,11 @@
+{
+  "name": "ripple-fieldjob",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Makes Ripple's worldwide wind and swell map tiles from Open-Meteo's public model files, packed one file per forecast hour.",
+  "type": "module",
+  "license": "GPL-2.0-only",
+  "engines": { "node": ">=20" },
+  "scripts": { "job": "node job.mjs" },
+  "dependencies": { "@openmeteo/file-reader": "0.0.21" }
+}
